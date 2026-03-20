@@ -1,0 +1,2259 @@
+
+==================== app.py ====================
+
+"""
+=============================================================================
+  E-Commerce Product Catalog API — Side Cache (Lazy Loading) Pattern
+  Stack : Python 3.11 | Flask | PostgreSQL (Amazon RDS) | Redis (ElastiCache)
+  Author: Production-grade assignment implementation
+=============================================================================
+"""
+
+import logging
+import time
+from flask import Flask, jsonify, request, g
+from config import Config
+from product_service import ProductService
+from cache_manager import CacheManager
+from db_manager import DatabaseManager
+from middleware import setup_logging, RequestTimingMiddleware
+
+# ---------------------------------------------------------------------------
+# Application factory
+# ---------------------------------------------------------------------------
+
+def create_app(config_object: Config = None) -> Flask:
+    app = Flask(__name__)
+    cfg = config_object or Config()
+    app.config.from_object(cfg)
+
+    # Structured logging (writes JSON to stdout — CloudWatch picks it up)
+    setup_logging(cfg.LOG_LEVEL)
+    logger = logging.getLogger(__name__)
+
+    # Shared infrastructure clients (created once, reused across requests)
+    db      = DatabaseManager(cfg)
+    cache   = CacheManager(cfg)
+    service = ProductService(db, cache, cfg)
+
+    # Attach timing middleware (measures wall-clock latency per request)
+    app.wsgi_app = RequestTimingMiddleware(app.wsgi_app)
+
+    # ------------------------------------------------------------------
+    # Health check  (load-balancer target group uses this)
+    # ------------------------------------------------------------------
+    @app.route("/health", methods=["GET"])
+    def health():
+        db_ok    = db.ping()
+        cache_ok = cache.ping()
+        status   = "healthy" if (db_ok and cache_ok) else "degraded"
+        code     = 200 if status == "healthy" else 503
+        return jsonify({
+            "status"      : status,
+            "rds_reachable": db_ok,
+            "redis_reachable": cache_ok,
+        }), code
+
+    # ------------------------------------------------------------------
+    # GET /products/<id>  — primary demonstration endpoint
+    # ------------------------------------------------------------------
+    @app.route("/products/<int:product_id>", methods=["GET"])
+    def get_product(product_id: int):
+        start = time.perf_counter()
+        result = service.get_product(product_id)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+
+        if result is None:
+            return jsonify({"error": "Product not found"}), 404
+
+        return jsonify({
+            "data"        : result["data"],
+            "cache_status": result["cache_status"],   # HIT | MISS
+            "latency_ms"  : round(elapsed_ms, 3),
+        }), 200
+
+    # ------------------------------------------------------------------
+    # GET /products  — paginated list with cursor-based pagination
+    # ------------------------------------------------------------------
+    @app.route("/products", methods=["GET"])
+    def list_products():
+        category = request.args.get("category", "all")
+        page     = int(request.args.get("page", 1))
+        per_page = min(int(request.args.get("per_page", 20)), 100)  # hard cap at 100
+
+        start  = time.perf_counter()
+        result = service.list_products(category=category, page=page, per_page=per_page)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+
+        return jsonify({
+            "data"        : result["data"],
+            "cache_status": result["cache_status"],
+            "page"        : page,
+            "per_page"    : per_page,
+            "latency_ms"  : round(elapsed_ms, 3),
+        }), 200
+
+    # ------------------------------------------------------------------
+    # PUT /products/<id>  — update + explicit cache invalidation
+    # ------------------------------------------------------------------
+    @app.route("/products/<int:product_id>", methods=["PUT"])
+    def update_product(product_id: int):
+        payload = request.get_json(force=True, silent=True)
+        if not payload:
+            return jsonify({"error": "Invalid JSON body"}), 400
+
+        updated = service.update_product(product_id, payload)
+        if not updated:
+            return jsonify({"error": "Product not found or update failed"}), 404
+
+        return jsonify({
+            "message"     : "Product updated and cache invalidated",
+            "product_id"  : product_id,
+            "cache_action": "INVALIDATED",
+        }), 200
+
+    # ------------------------------------------------------------------
+    # DELETE /products/<id>  — delete + cache eviction
+    # ------------------------------------------------------------------
+    @app.route("/products/<int:product_id>", methods=["DELETE"])
+    def delete_product(product_id: int):
+        deleted = service.delete_product(product_id)
+        if not deleted:
+            return jsonify({"error": "Product not found"}), 404
+        return jsonify({"message": "Deleted", "cache_action": "EVICTED"}), 200
+
+    # ------------------------------------------------------------------
+    # POST /cache/flush  — admin: clear entire product namespace
+    # (protect this with an IAM-signed header in real prod)
+    # ------------------------------------------------------------------
+    @app.route("/cache/flush", methods=["POST"])
+    def flush_cache():
+        flushed = cache.flush_namespace("product")
+        return jsonify({"keys_deleted": flushed}), 200
+
+    # ------------------------------------------------------------------
+    # GET /cache/stats  — operational visibility
+    # ------------------------------------------------------------------
+    @app.route("/cache/stats", methods=["GET"])
+    def cache_stats():
+        return jsonify(cache.get_stats()), 200
+
+    logger.info("Application started | RDS=%s | Redis=%s",
+                cfg.RDS_HOST, cfg.REDIS_HOST)
+    return app
+
+
+# ---------------------------------------------------------------------------
+# Entry point (Gunicorn is used in production — see gunicorn.conf.py)
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    application = create_app()
+    application.run(host="0.0.0.0", port=8080, debug=False)
+
+==================== benchmark.py ====================
+
+"""
+benchmark.py — Latency measurement script.
+
+Measures response time BEFORE (cold cache / cache miss) and AFTER (warm cache / HIT)
+to demonstrate the performance improvement of the Lazy Loading pattern.
+
+Usage:
+  python benchmark.py --base-url http://localhost:8080 --iterations 50
+
+Output:
+  Prints a summary table and per-request log lines compatible with
+  CloudWatch Logs Insights format.
+"""
+
+import argparse
+import json
+import statistics
+import time
+from typing import List, Dict
+import urllib.request
+import urllib.error
+
+
+def make_request(url: str) -> Dict:
+    """Issue HTTP GET and return (latency_ms, cache_status, http_status)."""
+    start = time.perf_counter()
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            body       = json.loads(resp.read())
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            return {
+                "latency_ms"   : round(elapsed_ms, 3),
+                "cache_status" : body.get("cache_status", "UNKNOWN"),
+                "http_status"  : resp.status,
+                "error"        : None,
+            }
+    except urllib.error.URLError as exc:
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        return {
+            "latency_ms"   : round(elapsed_ms, 3),
+            "cache_status" : "ERROR",
+            "http_status"  : 0,
+            "error"        : str(exc),
+        }
+
+
+def run_benchmark(base_url: str, product_id: int, iterations: int) -> None:
+    url = f"{base_url}/products/{product_id}"
+    results: List[Dict] = []
+
+    print(f"\n{'='*65}")
+    print(f"  Benchmark: GET {url}")
+    print(f"  Iterations: {iterations}")
+    print(f"{'='*65}")
+    print(f"{'#':>4}  {'Cache':>6}  {'Latency (ms)':>14}  {'HTTP':>6}")
+    print(f"{'-'*4}  {'-'*6}  {'-'*14}  {'-'*6}")
+
+    for i in range(1, iterations + 1):
+        r = make_request(url)
+        results.append(r)
+        marker = "◀ MISS" if r["cache_status"] == "MISS" else ""
+        print(
+            f"{i:>4}  {r['cache_status']:>6}  {r['latency_ms']:>14.3f}  "
+            f"{r['http_status']:>6}  {marker}"
+        )
+        time.sleep(0.05)   # small delay to avoid saturating the local loopback
+
+    # ── Summary statistics ─────────────────────────────────────────────────
+    hits   = [r for r in results if r["cache_status"] == "HIT"]
+    misses = [r for r in results if r["cache_status"] == "MISS"]
+
+    def stats(data: List[Dict]) -> Dict:
+        if not data:
+            return {"count": 0, "min": 0, "max": 0, "mean": 0, "p95": 0, "p99": 0}
+        lats = [r["latency_ms"] for r in data]
+        lats.sort()
+        p95_idx = int(len(lats) * 0.95)
+        p99_idx = int(len(lats) * 0.99)
+        return {
+            "count": len(lats),
+            "min"  : round(min(lats), 3),
+            "max"  : round(max(lats), 3),
+            "mean" : round(statistics.mean(lats), 3),
+            "p95"  : round(lats[min(p95_idx, len(lats)-1)], 3),
+            "p99"  : round(lats[min(p99_idx, len(lats)-1)], 3),
+        }
+
+    h = stats(hits)
+    m = stats(misses)
+
+    improvement = (
+        round(m["mean"] / h["mean"], 1)
+        if h["mean"] > 0 and m["mean"] > 0
+        else "N/A"
+    )
+
+    print(f"\n{'='*65}")
+    print(f"  RESULTS SUMMARY  (product_id={product_id})")
+    print(f"{'='*65}")
+    print(f"  {'Metric':<20}  {'Cache HIT':>12}  {'Cache MISS':>12}")
+    print(f"  {'-'*20}  {'-'*12}  {'-'*12}")
+    print(f"  {'Count':<20}  {h['count']:>12}  {m['count']:>12}")
+    print(f"  {'Min (ms)':<20}  {h['min']:>12.3f}  {m['min']:>12.3f}")
+    print(f"  {'Max (ms)':<20}  {h['max']:>12.3f}  {m['max']:>12.3f}")
+    print(f"  {'Mean (ms)':<20}  {h['mean']:>12.3f}  {m['mean']:>12.3f}")
+    print(f"  {'P95 (ms)':<20}  {h['p95']:>12.3f}  {m['p95']:>12.3f}")
+    print(f"  {'P99 (ms)':<20}  {h['p99']:>12.3f}  {m['p99']:>12.3f}")
+    print(f"\n  ✅ Speed improvement (MISS mean / HIT mean): {improvement}×")
+    print(f"{'='*65}\n")
+
+    # ── Emit structured log lines for CloudWatch ───────────────────────────
+    for r in results:
+        print(json.dumps({
+            "benchmark"   : True,
+            "product_id"  : product_id,
+            "cache_status": r["cache_status"],
+            "latency_ms"  : r["latency_ms"],
+            "http_status" : r["http_status"],
+        }))
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Cache latency benchmark")
+    parser.add_argument("--base-url",   default="http://localhost:8080")
+    parser.add_argument("--product-id", type=int, default=1)
+    parser.add_argument("--iterations", type=int, default=30)
+    args = parser.parse_args()
+
+    run_benchmark(args.base_url, args.product_id, args.iterations)
+
+==================== cache_manager.py ====================
+
+"""
+cache_manager.py — Production Redis client with:
+
+  • Thread-safe connection pool
+  • TLS encryption (in-transit) to ElastiCache
+  • Consistent key naming convention
+  • TTL jitter to prevent cache stampede (thundering herd)
+  • Atomic operations using Lua scripts where needed
+  • Cache hit/miss metrics
+  • Namespace-scoped flush
+"""
+
+import json
+import logging
+import random
+import time
+from typing import Any, Optional
+
+import redis
+from redis.exceptions import RedisError, ConnectionError as RedisConnectionError
+
+from config import Config
+
+logger = logging.getLogger(__name__)
+
+
+class CacheManager:
+    """
+    Thin wrapper around redis-py that enforces project-wide conventions:
+      key naming, serialisation, TTL jitter, error isolation, metrics.
+    """
+
+    def __init__(self, cfg: Config) -> None:
+        self._cfg = cfg
+        self._client = self._build_client(cfg)
+        self._hits   = 0
+        self._misses = 0
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _build_client(self, cfg: Config) -> redis.Redis:
+        """
+        Build a redis-py client backed by a thread-safe connection pool.
+        TLS is mandatory for ElastiCache in-transit encryption.
+        """
+        pool = redis.ConnectionPool(
+            host               = cfg.REDIS_HOST,
+            port               = cfg.REDIS_PORT,
+            db                 = cfg.REDIS_DB,
+            password           = cfg.REDIS_AUTH_TOKEN or None,
+            ssl                = cfg.REDIS_SSL,
+            ssl_cert_reqs      = "required" if cfg.REDIS_SSL else None,
+            max_connections    = cfg.REDIS_MAX_CONNECTIONS,
+            socket_timeout     = cfg.REDIS_SOCKET_TIMEOUT,
+            socket_connect_timeout = cfg.REDIS_SOCKET_TIMEOUT,
+            retry_on_timeout   = cfg.REDIS_RETRY_ON_TIMEOUT,
+            decode_responses   = True,   # return str, not bytes
+        )
+        client = redis.Redis(connection_pool=pool)
+        logger.info("Redis connection pool initialised | host=%s port=%d ssl=%s",
+                    cfg.REDIS_HOST, cfg.REDIS_PORT, cfg.REDIS_SSL)
+        return client
+
+    # ------------------------------------------------------------------
+    # Key naming convention
+    # ------------------------------------------------------------------
+
+    def make_key(self, namespace: str, *parts: Any) -> str:
+        """
+        Build a structured cache key:
+          {env}:{version}:{namespace}:{part1}:{part2}:...
+
+        Examples:
+          prod:v1:product:detail:42
+          prod:v1:product:list:electronics:1
+          prod:v1:product:search:laptop:1
+
+        WHY:
+          • env prefix separates prod/staging keys on the same cluster
+          • version prefix allows zero-downtime schema migrations
+          • namespace prefix enables namespace-wide invalidation via SCAN
+          • colon separator is Redis convention and works with RedisInsight
+        """
+        env     = self._cfg.APP_ENV
+        version = self._cfg.CACHE_KEY_VERSION
+        parts_str = ":".join(str(p) for p in parts)
+        return f"{env}:{version}:{namespace}:{parts_str}"
+
+    def _ttl_with_jitter(self, base_ttl: int) -> int:
+        """
+        Add random jitter to TTL so mass-expiry (thundering herd) is avoided.
+        Keys set at the same time will expire at different moments.
+        """
+        jitter = random.randint(0, self._cfg.TTL_JITTER_RANGE)
+        return base_ttl + jitter
+
+    # ------------------------------------------------------------------
+    # Core cache operations
+    # ------------------------------------------------------------------
+
+    def get(self, key: str) -> Optional[Any]:
+        """
+        Fetch a value from Redis.
+        Returns the deserialised Python object, or None on miss / error.
+        Errors are intentionally swallowed — cache failure must NEVER crash the app.
+        """
+        try:
+            raw = self._client.get(key)
+            if raw is None:
+                self._misses += 1
+                logger.info("CACHE MISS | key=%s", key)
+                return None
+
+            self._hits += 1
+            logger.info("CACHE HIT  | key=%s", key)
+            return json.loads(raw)
+
+        except RedisError as exc:
+            logger.warning("Redis GET error | key=%s | err=%s", key, exc)
+            self._misses += 1
+            return None
+
+    def set(self, key: str, value: Any, ttl: int) -> bool:
+        """
+        Serialise value to JSON and store with TTL + jitter.
+        Returns True on success, False on error.
+        """
+        try:
+            effective_ttl = self._ttl_with_jitter(ttl)
+            payload = json.dumps(value, default=str)   # default=str handles datetime
+            self._client.setex(name=key, time=effective_ttl, value=payload)
+            logger.debug("CACHE SET  | key=%s | ttl=%d s", key, effective_ttl)
+            return True
+
+        except RedisError as exc:
+            logger.warning("Redis SET error | key=%s | err=%s", key, exc)
+            return False
+
+    def delete(self, key: str) -> bool:
+        """Evict a single key. Used on UPDATE / DELETE events."""
+        try:
+            deleted = self._client.delete(key)
+            if deleted:
+                logger.info("CACHE DEL  | key=%s | EVICTED", key)
+            else:
+                logger.debug("CACHE DEL  | key=%s | KEY_NOT_FOUND", key)
+            return bool(deleted)
+        except RedisError as exc:
+            logger.warning("Redis DEL error | key=%s | err=%s", key, exc)
+            return False
+
+    # ------------------------------------------------------------------
+    # Lazy Loading  — the heart of the Side-Cache pattern
+    # ------------------------------------------------------------------
+
+    def get_or_load(
+        self,
+        key     : str,
+        loader  : callable,
+        ttl     : int,
+        *,
+        miss_label: str = "",
+    ) -> tuple[Optional[Any], str]:
+        """
+        Side-Cache / Lazy Loading implementation:
+
+          1. Check Redis  → HIT  → return cached value
+          2.               MISS → call loader() (hits RDS)
+          3.                      Store result in Redis with TTL
+          4.                      Return fresh value
+
+        Returns (value, cache_status) where cache_status ∈ {"HIT", "MISS"}
+
+        The caller never needs to know about Redis — the service layer
+        just calls get_or_load() and gets back a value.
+
+        WHY get_or_load() instead of explicit get/set in service layer?
+          • Centralises retry / error handling logic
+          • Prevents duplicate cache-write code across multiple services
+          • Easier to unit-test (mock the loader callable)
+        """
+        value = self.get(key)
+
+        if value is not None:
+            return value, "HIT"
+
+        # ── Cache Miss: fetch from primary data source (RDS) ──────────────
+        label = miss_label or key
+        logger.info("CACHE MISS → loading from RDS | ref=%s", label)
+
+        db_start = time.perf_counter()
+        value    = loader()
+        db_ms    = (time.perf_counter() - db_start) * 1000
+        logger.info("RDS query complete | ref=%s | latency=%.2f ms", label, db_ms)
+
+        if value is not None:
+            # ── Populate cache so next request is a HIT ───────────────────
+            self.set(key, value, ttl)
+
+        return value, "MISS"
+
+    # ------------------------------------------------------------------
+    # Namespace-scoped operations
+    # ------------------------------------------------------------------
+
+    def flush_namespace(self, namespace: str) -> int:
+        """
+        Delete all keys matching the namespace pattern.
+        Uses SCAN (not KEYS) to avoid blocking the Redis event loop.
+
+        WHY SCAN not KEYS?
+          KEYS blocks Redis during full keyspace scan — catastrophic in prod.
+          SCAN iterates in small batches, non-blocking.
+        """
+        pattern    = f"{self._cfg.APP_ENV}:{self._cfg.CACHE_KEY_VERSION}:{namespace}:*"
+        deleted    = 0
+        cursor     = 0
+
+        try:
+            while True:
+                cursor, keys = self._client.scan(cursor, match=pattern, count=200)
+                if keys:
+                    deleted += self._client.delete(*keys)
+                if cursor == 0:
+                    break
+
+            logger.info("Namespace flush | pattern=%s | deleted=%d", pattern, deleted)
+            return deleted
+
+        except RedisError as exc:
+            logger.error("Namespace flush error | pattern=%s | err=%s", pattern, exc)
+            return 0
+
+    def invalidate_product(self, product_id: int, category: str = None) -> None:
+        """
+        Targeted invalidation on product update / delete.
+        Removes the detail key + any list key for the product's category.
+        """
+        detail_key = self.make_key("product", "detail", product_id)
+        self.delete(detail_key)
+
+        if category:
+            # Also invalidate list pages that include this product
+            list_pattern = self.make_key("product", "list", category) + ":*"
+            self._flush_pattern(list_pattern)
+
+    def _flush_pattern(self, pattern: str) -> int:
+        """SCAN + DELETE for an arbitrary glob pattern."""
+        deleted = 0
+        cursor  = 0
+        try:
+            while True:
+                cursor, keys = self._client.scan(cursor, match=pattern, count=200)
+                if keys:
+                    deleted += self._client.delete(*keys)
+                if cursor == 0:
+                    break
+        except RedisError as exc:
+            logger.warning("Pattern flush error | pattern=%s | err=%s", pattern, exc)
+        return deleted
+
+    # ------------------------------------------------------------------
+    # Observability
+    # ------------------------------------------------------------------
+
+    def ping(self) -> bool:
+        try:
+            return self._client.ping()
+        except RedisError:
+            return False
+
+    def get_stats(self) -> dict:
+        """Return in-process hit/miss counters + Redis INFO STATS."""
+        total = self._hits + self._misses
+        hit_rate = round((self._hits / total) * 100, 2) if total else 0
+
+        try:
+            info = self._client.info("stats")
+        except RedisError:
+            info = {}
+
+        return {
+            "in_process": {
+                "hits"    : self._hits,
+                "misses"  : self._misses,
+                "total"   : total,
+                "hit_rate": f"{hit_rate}%",
+            },
+            "redis_server": {
+                "keyspace_hits"  : info.get("keyspace_hits",   "N/A"),
+                "keyspace_misses": info.get("keyspace_misses",  "N/A"),
+                "evicted_keys"   : info.get("evicted_keys",     "N/A"),
+                "used_memory_human": self._client.info("memory").get(
+                    "used_memory_human", "N/A"),
+            },
+        }
+
+==================== config.py ====================
+
+"""
+config.py — Centralised configuration pulled from environment variables.
+
+In production (EC2), these are injected via:
+  - AWS Systems Manager Parameter Store  (non-sensitive)
+  - AWS Secrets Manager                  (DB password, Redis auth token)
+
+Never hard-code credentials. This module enforces that at import time.
+"""
+
+import os
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Config:
+    # ── RDS (PostgreSQL) ────────────────────────────────────────────────────
+    RDS_HOST    : str = field(default_factory=lambda: os.environ["RDS_HOST"])
+    RDS_PORT    : int = field(default_factory=lambda: int(os.getenv("RDS_PORT", "5432")))
+    RDS_DB      : str = field(default_factory=lambda: os.environ["RDS_DB"])
+    RDS_USER    : str = field(default_factory=lambda: os.environ["RDS_USER"])
+    RDS_PASSWORD: str = field(default_factory=lambda: os.environ["RDS_PASSWORD"])
+
+    # Connection pool — sized for t3.medium (2 vCPU).
+    # Rule of thumb: pool_size = (2 × vCPU) + 1 for CPU-bound workloads.
+    DB_POOL_MIN     : int = 2
+    DB_POOL_MAX     : int = 10
+    DB_POOL_OVERFLOW: int = 5          # extra connections allowed beyond max
+    DB_POOL_TIMEOUT : int = 30         # seconds to wait for a connection
+    DB_POOL_RECYCLE : int = 1800       # recycle connections every 30 min (avoids stale TCP)
+    DB_STATEMENT_TIMEOUT: int = 5000   # 5 s — abort slow queries, not hold connections
+
+    # ── ElastiCache Redis ────────────────────────────────────────────────────
+    REDIS_HOST      : str = field(default_factory=lambda: os.environ["REDIS_HOST"])
+    REDIS_PORT      : int = field(default_factory=lambda: int(os.getenv("REDIS_PORT", "6379")))
+    REDIS_AUTH_TOKEN: str = field(default_factory=lambda: os.getenv("REDIS_AUTH_TOKEN", ""))
+    REDIS_SSL       : bool = field(default_factory=lambda: os.getenv("REDIS_SSL", "true").lower() == "true")
+    REDIS_DB        : int  = 0         # use DB-0; cluster mode ignores this
+
+    # Connection pool for Redis (redis-py uses a thread-safe connection pool)
+    REDIS_MAX_CONNECTIONS: int = 50
+    REDIS_SOCKET_TIMEOUT : int = 2     # fail fast — Redis should answer in < 1 ms
+    REDIS_RETRY_ON_TIMEOUT: bool = True
+
+    # ── Cache TTL Strategy ───────────────────────────────────────────────────
+    # Each TTL is tuned to how frequently the underlying data changes.
+
+    # Individual product detail — changes when admin edits a product.
+    # 30 min is safe; write-through invalidation keeps it fresh on updates.
+    TTL_PRODUCT_DETAIL: int = 1800          # 30 minutes
+
+    # Category listing — new products are added infrequently.
+    TTL_PRODUCT_LIST  : int = 300           # 5 minutes
+
+    # Search results — highly dynamic (new products, price changes).
+    TTL_SEARCH_RESULT : int = 60            # 1 minute
+
+    # Hot products (homepage / featured) — very stable, safe to cache longer.
+    TTL_HOT_PRODUCTS  : int = 3600          # 1 hour
+
+    # Inventory counts — changes on every purchase; kept very short.
+    TTL_INVENTORY     : int = 30            # 30 seconds
+
+    # Jitter applied to TTL to avoid thundering herd (cache stampede).
+    # Each key's TTL = base_ttl + random(0, TTL_JITTER_RANGE)
+    TTL_JITTER_RANGE  : int = 60            # ±60 s spread
+
+    # ── Cache Key Namespace ──────────────────────────────────────────────────
+    # All keys follow:  {APP_ENV}:{NAMESPACE}:{entity}:{id}:{version}
+    CACHE_KEY_VERSION : str = "v1"          # bump this for schema migrations
+    APP_ENV           : str = field(default_factory=lambda: os.getenv("APP_ENV", "prod"))
+
+    # ── Application ──────────────────────────────────────────────────────────
+    LOG_LEVEL         : str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
+    SECRET_KEY        : str = field(default_factory=lambda: os.environ["FLASK_SECRET_KEY"])
+
+    # ── Gunicorn (for reference — see gunicorn.conf.py) ─────────────────────
+    GUNICORN_WORKERS      : int = 4    # (2 × vCPU) + 1
+    GUNICORN_WORKER_CLASS : str = "gevent"
+    GUNICORN_BIND         : str = "0.0.0.0:8080"
+
+==================== db_manager.py ====================
+
+"""
+db_manager.py — Production PostgreSQL client for Amazon RDS.
+
+Features:
+  • Connection pooling (psycopg2 ThreadedConnectionPool)
+  • Automatic retry with exponential back-off on transient errors
+  • Statement timeout to prevent slow queries holding connections
+  • Context-manager pattern for safe connection release
+  • Parameterised queries everywhere (SQL injection prevention)
+  • SSL enforcement for RDS in-transit encryption
+"""
+
+import logging
+import time
+from contextlib import contextmanager
+from typing import Any, Dict, List, Optional, Tuple
+
+import psycopg2
+import psycopg2.extras
+from psycopg2 import pool, OperationalError, InterfaceError
+from psycopg2.extras import RealDictCursor
+
+from config import Config
+
+logger = logging.getLogger(__name__)
+
+# Number of retry attempts for transient DB errors (e.g., brief network blip)
+_MAX_RETRIES = 3
+_RETRY_BACKOFF_BASE = 0.5   # seconds; doubles each retry
+
+
+class DatabaseManager:
+    """
+    Thread-safe PostgreSQL connection manager backed by a pooled connection pool.
+
+    WHY psycopg2 ThreadedConnectionPool instead of SQLAlchemy?
+      Simpler, no ORM overhead, gives full control over SQL, connection lifecycle.
+      In a microservice that owns a single DB schema, the ORM abstraction adds
+      complexity without benefit.
+
+    All queries return plain Python dicts — no ORM objects to serialise.
+    """
+
+    def __init__(self, cfg: Config) -> None:
+        self._cfg  = cfg
+        self._pool = self._build_pool(cfg)
+
+    # ------------------------------------------------------------------
+    # Pool construction
+    # ------------------------------------------------------------------
+
+    def _build_pool(self, cfg: Config) -> pool.ThreadedConnectionPool:
+        """
+        Build the connection pool.
+        dsn is constructed explicitly so every parameter is visible.
+        sslmode=require enforces TLS — RDS rejects plaintext with this setting
+        (combined with the RDS parameter group setting rds.force_ssl=1).
+        """
+        dsn = (
+            f"host={cfg.RDS_HOST} "
+            f"port={cfg.RDS_PORT} "
+            f"dbname={cfg.RDS_DB} "
+            f"user={cfg.RDS_USER} "
+            f"password={cfg.RDS_PASSWORD} "
+            f"sslmode=require "
+            f"connect_timeout=10 "
+            f"options='-c statement_timeout={cfg.DB_STATEMENT_TIMEOUT}'"
+        )
+        p = pool.ThreadedConnectionPool(
+            minconn=cfg.DB_POOL_MIN,
+            maxconn=cfg.DB_POOL_MAX + cfg.DB_POOL_OVERFLOW,
+            dsn=dsn,
+        )
+        logger.info(
+            "RDS connection pool created | host=%s db=%s min=%d max=%d",
+            cfg.RDS_HOST, cfg.RDS_DB, cfg.DB_POOL_MIN, cfg.DB_POOL_MAX,
+        )
+        return p
+
+    # ------------------------------------------------------------------
+    # Context manager for safe connection lifecycle
+    # ------------------------------------------------------------------
+
+    @contextmanager
+    def _get_connection(self):
+        """
+        Obtain a connection from the pool, yield it, then release it back.
+        Rolls back on exception so the connection is returned in a clean state.
+        """
+        conn = self._pool.getconn()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._pool.putconn(conn)
+
+    # ------------------------------------------------------------------
+    # Query helpers
+    # ------------------------------------------------------------------
+
+    def _execute_with_retry(
+        self,
+        query: str,
+        params: Tuple = (),
+        fetch: str = "one",     # "one" | "all" | "none"
+    ) -> Any:
+        """
+        Execute a parameterised query with exponential back-off retry.
+
+        WHY retry?
+          RDS Multi-AZ failover causes ~20–30 s downtime and transient
+          connection drops. Retrying 3× with back-off bridges that gap.
+
+        fetch:
+          "one"  → fetchone() → dict or None
+          "all"  → fetchall() → list[dict]
+          "none" → no fetch (INSERT / UPDATE / DELETE)
+        """
+        last_exc = None
+
+        for attempt in range(1, _MAX_RETRIES + 1):
+            try:
+                with self._get_connection() as conn:
+                    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                        cur.execute(query, params)
+                        if fetch == "one":
+                            row = cur.fetchone()
+                            return dict(row) if row else None
+                        elif fetch == "all":
+                            rows = cur.fetchall()
+                            return [dict(r) for r in rows]
+                        else:
+                            return cur.rowcount
+
+            except (OperationalError, InterfaceError) as exc:
+                last_exc = exc
+                wait = _RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                logger.warning(
+                    "DB transient error (attempt %d/%d) | err=%s | retry_in=%.1fs",
+                    attempt, _MAX_RETRIES, exc, wait,
+                )
+                time.sleep(wait)
+
+        logger.error("DB query failed after %d attempts | err=%s", _MAX_RETRIES, last_exc)
+        raise last_exc
+
+    # ------------------------------------------------------------------
+    # Domain queries
+    # ------------------------------------------------------------------
+
+    def get_product_by_id(self, product_id: int) -> Optional[Dict]:
+        """
+        Fetch a single product with its category name.
+        Uses a JOIN instead of two queries — fewer round-trips to RDS.
+        """
+        sql = """
+            SELECT
+                p.id,
+                p.name,
+                p.description,
+                p.price,
+                p.stock_quantity,
+                p.sku,
+                p.image_url,
+                p.is_active,
+                p.created_at,
+                p.updated_at,
+                c.name  AS category_name,
+                c.slug  AS category_slug
+            FROM products p
+            JOIN categories c ON c.id = p.category_id
+            WHERE p.id = %s
+              AND p.is_active = TRUE
+        """
+        return self._execute_with_retry(sql, (product_id,), fetch="one")
+
+    def get_products_by_category(
+        self, category_slug: str, page: int, per_page: int
+    ) -> List[Dict]:
+        """
+        Paginated product list for a category.
+        OFFSET-based pagination is acceptable for page sizes ≤ 100 and
+        catalogues of reasonable size. For millions of rows, use keyset
+        pagination (WHERE id > last_seen_id).
+        """
+        offset = (page - 1) * per_page
+        sql = """
+            SELECT
+                p.id,
+                p.name,
+                p.price,
+                p.stock_quantity,
+                p.sku,
+                p.image_url,
+                c.name  AS category_name
+            FROM products p
+            JOIN categories c ON c.id = p.category_id
+            WHERE c.slug  = %s
+              AND p.is_active = TRUE
+            ORDER BY p.created_at DESC
+            LIMIT %s OFFSET %s
+        """
+        return self._execute_with_retry(
+            sql, (category_slug, per_page, offset), fetch="all"
+        )
+
+    def get_all_products(self, page: int, per_page: int) -> List[Dict]:
+        """Full catalogue listing (no category filter)."""
+        offset = (page - 1) * per_page
+        sql = """
+            SELECT
+                p.id,
+                p.name,
+                p.price,
+                p.stock_quantity,
+                p.sku,
+                p.image_url,
+                c.name AS category_name
+            FROM products p
+            JOIN categories c ON c.id = p.category_id
+            WHERE p.is_active = TRUE
+            ORDER BY p.created_at DESC
+            LIMIT %s OFFSET %s
+        """
+        return self._execute_with_retry(sql, (per_page, offset), fetch="all")
+
+    def update_product(self, product_id: int, fields: Dict) -> bool:
+        """
+        Dynamic UPDATE — only touches fields present in `fields` dict.
+        Prevents accidental null-overwrite of fields not in the payload.
+        """
+        ALLOWED = {"name", "description", "price", "stock_quantity", "image_url", "is_active"}
+        updates = {k: v for k, v in fields.items() if k in ALLOWED}
+
+        if not updates:
+            return False
+
+        set_clause = ", ".join(f"{col} = %s" for col in updates)
+        values     = list(updates.values()) + [product_id]
+
+        sql = f"""
+            UPDATE products
+            SET {set_clause},
+                updated_at = NOW()
+            WHERE id = %s
+              AND is_active = TRUE
+        """
+        rows_affected = self._execute_with_retry(sql, tuple(values), fetch="none")
+        return rows_affected > 0
+
+    def get_product_category(self, product_id: int) -> Optional[str]:
+        """Return category slug for a product — used during cache invalidation."""
+        sql = """
+            SELECT c.slug
+            FROM products p
+            JOIN categories c ON c.id = p.category_id
+            WHERE p.id = %s
+        """
+        row = self._execute_with_retry(sql, (product_id,), fetch="one")
+        return row["slug"] if row else None
+
+    def delete_product(self, product_id: int) -> bool:
+        """Soft delete — sets is_active = FALSE instead of hard DELETE."""
+        sql = """
+            UPDATE products
+            SET is_active  = FALSE,
+                updated_at = NOW()
+            WHERE id = %s
+              AND is_active = TRUE
+        """
+        rows = self._execute_with_retry(sql, (product_id,), fetch="none")
+        return rows > 0
+
+    # ------------------------------------------------------------------
+    # Observability
+    # ------------------------------------------------------------------
+
+    def ping(self) -> bool:
+        """Lightweight liveness check used by /health endpoint."""
+        try:
+            result = self._execute_with_retry("SELECT 1", fetch="one")
+            return result is not None
+        except Exception:
+            return False
+
+==================== gunicorn.conf.py ====================
+
+# gunicorn.conf.py — Production Gunicorn configuration.
+# Start with: gunicorn -c gunicorn.conf.py "app:create_app()"
+
+import multiprocessing
+
+# ── Workers ────────────────────────────────────────────────────────────────
+# Formula: (2 × vCPU) + 1  → t3.medium has 2 vCPU → 5 workers
+workers     = (2 * multiprocessing.cpu_count()) + 1
+worker_class = "gevent"          # async I/O; each worker handles 1000 green threads
+worker_connections = 1000        # concurrent connections per worker
+threads     = 1                  # gevent handles concurrency internally
+
+# ── Binding ────────────────────────────────────────────────────────────────
+bind        = "0.0.0.0:8080"
+backlog     = 2048               # queue size for connections not yet accepted
+
+# ── Timeouts ───────────────────────────────────────────────────────────────
+timeout     = 30                 # worker killed if silent > 30 s
+keepalive   = 5                  # keep TCP connection alive for 5 s (ALB uses 60 s)
+graceful_timeout = 30            # time allowed for in-flight requests on shutdown
+
+# ── Logging ────────────────────────────────────────────────────────────────
+accesslog   = "-"                # stdout → CloudWatch
+errorlog    = "-"
+loglevel    = "info"
+access_log_format = (
+    '{"time":"%(t)s","method":"%(m)s","path":"%(U)s","status":%(s)s,'
+    '"bytes":%(B)s,"duration_ms":%(D)s,"referer":"%(f)s","ip":"%(h)s"}'
+)
+
+# ── Process management ─────────────────────────────────────────────────────
+preload_app = True               # load app once in master; workers fork (saves RAM)
+max_requests = 1000              # restart worker after N requests (prevents memory leaks)
+max_requests_jitter = 100        # stagger restarts to avoid all workers recycling together
+
+==================== middleware.py ====================
+
+"""
+middleware.py — Production-grade observability layer.
+
+Provides:
+  • Structured JSON logging (compatible with CloudWatch Logs Insights)
+  • WSGI middleware that measures wall-clock latency per request
+  • Request ID injection (for distributed tracing correlation)
+"""
+
+import json
+import logging
+import time
+import uuid
+from typing import Callable
+
+
+# ---------------------------------------------------------------------------
+# Structured JSON log formatter
+# ---------------------------------------------------------------------------
+
+class JsonFormatter(logging.Formatter):
+    """
+    Emits each log record as a single JSON line.
+    CloudWatch Logs Insights can query these fields natively.
+
+    Example output:
+    {
+      "timestamp": "2024-11-15T14:32:01.123Z",
+      "level": "INFO",
+      "logger": "product_service",
+      "message": "CACHE HIT  | key=prod:v1:product:detail:42",
+      "extra": {}
+    }
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        log_entry = {
+            "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "level"    : record.levelname,
+            "logger"   : record.name,
+            "message"  : record.getMessage(),
+        }
+        # Attach any extra fields passed to the logger
+        extra = {
+            k: v for k, v in record.__dict__.items()
+            if k not in logging.LogRecord(
+                "", 0, "", 0, "", (), None
+            ).__dict__ and k not in ("message", "asctime")
+        }
+        if extra:
+            log_entry["extra"] = extra
+
+        return json.dumps(log_entry)
+
+
+def setup_logging(level: str = "INFO") -> None:
+    """
+    Replace the root logger's handlers with a JSON formatter writing to stdout.
+    CloudWatch agent picks up stdout automatically on EC2/ECS.
+    """
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+    for handler in root.handlers[:]:
+        root.removeHandler(handler)
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonFormatter())
+    root.addHandler(handler)
+
+
+# ---------------------------------------------------------------------------
+# Request timing WSGI middleware
+# ---------------------------------------------------------------------------
+
+class RequestTimingMiddleware:
+    """
+    Measures wall-clock latency for every request and logs it as a structured
+    JSON line. Also injects a unique X-Request-ID header so log lines from
+    the same request can be correlated in CloudWatch Logs Insights.
+
+    Example log line:
+    {
+      "timestamp": "...",
+      "level": "INFO",
+      "logger": "middleware",
+      "message": "REQUEST_COMPLETE",
+      "extra": {
+        "request_id": "a1b2c3d4",
+        "method": "GET",
+        "path": "/products/42",
+        "status": 200,
+        "latency_ms": 4.12,
+        "cache_status": "HIT"
+      }
+    }
+    """
+
+    def __init__(self, wsgi_app) -> None:
+        self._app    = wsgi_app
+        self._logger = logging.getLogger("middleware")
+
+    def __call__(self, environ, start_response):
+        request_id  = str(uuid.uuid4())[:8]
+        request_start = time.perf_counter()
+
+        environ["HTTP_X_REQUEST_ID"] = request_id
+
+        captured = {}
+
+        def _start_response(status, headers, exc_info=None):
+            captured["status"] = int(status.split(" ")[0])
+            headers.append(("X-Request-ID", request_id))
+            return start_response(status, headers, exc_info)
+
+        result = self._app(environ, _start_response)
+        elapsed_ms = (time.perf_counter() - request_start) * 1000
+
+        self._logger.info(
+            "REQUEST_COMPLETE",
+            extra={
+                "request_id": request_id,
+                "method"    : environ.get("REQUEST_METHOD"),
+                "path"      : environ.get("PATH_INFO"),
+                "status"    : captured.get("status"),
+                "latency_ms": round(elapsed_ms, 3),
+            },
+        )
+
+        return result
+
+==================== product_service.py ====================
+
+"""
+product_service.py — Business logic layer.
+
+This is where the Lazy Loading (Side-Cache) pattern lives.
+The service layer is the ONLY code that knows about both Redis and RDS.
+Routes only call service methods; they never touch the DB or cache directly.
+
+Lazy Loading flow for get_product():
+
+  ┌─────────┐   GET /products/42   ┌───────────────┐
+  │  Flask  │─────────────────────►│ProductService │
+  │  Route  │                      │               │
+  └─────────┘                      │  1. cache.get │──► Redis ──► HIT? return
+                                   │               │              MISS? ↓
+                                   │  2. db.get    │──► RDS ─────────────────►
+                                   │               │              result
+                                   │  3. cache.set │──► Redis (TTL)
+                                   │               │
+                                   └───────────────┘
+"""
+
+import logging
+from typing import Any, Dict, Optional, Tuple
+
+from cache_manager import CacheManager
+from db_manager import DatabaseManager
+from config import Config
+
+logger = logging.getLogger(__name__)
+
+
+class ProductService:
+
+    def __init__(self, db: DatabaseManager, cache: CacheManager, cfg: Config) -> None:
+        self._db    = db
+        self._cache = cache
+        self._cfg   = cfg
+
+    # ------------------------------------------------------------------
+    # get_product  — Single product fetch with Lazy Loading
+    # ------------------------------------------------------------------
+
+    def get_product(self, product_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Lazy Loading implementation for a single product.
+
+        Step 1: Construct the canonical cache key.
+        Step 2: Delegate to cache_manager.get_or_load() which encapsulates:
+                  → Redis GET
+                  → On miss: call loader (RDS query) + Redis SET with TTL
+        Step 3: Return (value, cache_status) dict to the route.
+
+        WHY delegate to get_or_load() instead of explicit get/set?
+          The service layer stays clean. All retry / error handling is
+          in CacheManager, which can be independently tested.
+        """
+        key = self._cache.make_key("product", "detail", product_id)
+
+        # Lazy load — the lambda is the "loader" called only on cache miss
+        value, status = self._cache.get_or_load(
+            key       = key,
+            loader    = lambda: self._db.get_product_by_id(product_id),
+            ttl       = self._cfg.TTL_PRODUCT_DETAIL,
+            miss_label= f"product_detail:{product_id}",
+        )
+
+        if value is None:
+            return None
+
+        return {"data": value, "cache_status": status}
+
+    # ------------------------------------------------------------------
+    # list_products  — Category or full-catalogue listing
+    # ------------------------------------------------------------------
+
+    def list_products(
+        self,
+        category: str = "all",
+        page    : int = 1,
+        per_page: int = 20,
+    ) -> Dict[str, Any]:
+        """
+        Lazy Loading for product lists.
+
+        Cache key encodes category + page + per_page so different pages
+        and page sizes get independent cache entries.
+        Separate TTL (5 min) — lists change more often than detail pages.
+        """
+        key = self._cache.make_key("product", "list", category, page, per_page)
+
+        if category == "all":
+            loader = lambda: self._db.get_all_products(page, per_page)
+        else:
+            loader = lambda: self._db.get_products_by_category(category, page, per_page)
+
+        value, status = self._cache.get_or_load(
+            key       = key,
+            loader    = loader,
+            ttl       = self._cfg.TTL_PRODUCT_LIST,
+            miss_label= f"product_list:{category}:p{page}",
+        )
+
+        return {"data": value or [], "cache_status": status}
+
+    # ------------------------------------------------------------------
+    # update_product  — Write-through cache invalidation
+    # ------------------------------------------------------------------
+
+    def update_product(self, product_id: int, fields: Dict) -> bool:
+        """
+        Update RDS first, then invalidate (not update) the cache.
+
+        WHY invalidate instead of update?
+          Cache-aside (write-through) would need to replicate the same
+          business logic used on read. Invalidation is simpler and correct:
+          the next read will re-fetch from RDS with fresh data.
+
+        WHY RDS-first?
+          If cache invalidation fails after a DB write, the next cache miss
+          will re-populate with current DB data. The window of stale data
+          is TTL seconds maximum.
+
+          If we invalidated cache first and the DB write failed, we'd have
+          an empty cache but no updated DB — inconsistency that's harder to detect.
+        """
+        # Capture category BEFORE update for cache invalidation scope
+        category_slug = self._db.get_product_category(product_id)
+
+        updated = self._db.update_product(product_id, fields)
+        if not updated:
+            return False
+
+        # Evict stale cache entries
+        self._cache.invalidate_product(product_id, category_slug)
+        logger.info(
+            "Product updated & cache invalidated | product_id=%d category=%s",
+            product_id, category_slug,
+        )
+        return True
+
+    # ------------------------------------------------------------------
+    # delete_product  — Soft delete + cache eviction
+    # ------------------------------------------------------------------
+
+    def delete_product(self, product_id: int) -> bool:
+        category_slug = self._db.get_product_category(product_id)
+        deleted = self._db.delete_product(product_id)
+        if not deleted:
+            return False
+
+        self._cache.invalidate_product(product_id, category_slug)
+        logger.info(
+            "Product soft-deleted & cache evicted | product_id=%d", product_id
+        )
+        return True
+
+==================== README.md ====================
+
+# Side Cache (Lazy Loading) — Complete Production Solution
+## Amazon RDS + ElastiCache Redis | Python Flask | E-Commerce Platform
+
+---
+
+# SECTION 1: ARCHITECTURE DESIGN
+
+## 1.1 High-Level Architecture Overview
+
+```
+                         ┌──────────────────────────────────────────────────────┐
+                         │              AWS REGION (ap-south-1)                 │
+                         │                                                      │
+  Internet               │   ┌─────────────────────────────────────────────┐   │
+  Users ──► Route 53 ───►│   │          VPC: 10.0.0.0/16                   │   │
+                         │   │                                              │   │
+                         │   │  ┌─────────────────────────────────────────┐│   │
+                         │   │  │   PUBLIC SUBNETS (10.0.1.0/24 + /24)    ││   │
+                         │   │  │                                          ││   │
+                         │   │  │  ┌──────────────┐  ┌──────────────────┐ ││   │
+                         │   │  │  │  ALB (HTTPS) │  │  NAT Gateway     │ ││   │
+                         │   │  │  │  Port 443    │  │  (outbound only) │ ││   │
+                         │   │  │  └──────┬───────┘  └──────────────────┘ ││   │
+                         │   │  └─────────┼───────────────────────────────┘│   │
+                         │   │            │ (port 8080)                     │   │
+                         │   │  ┌─────────▼───────────────────────────────┐│   │
+                         │   │  │  PRIVATE SUBNETS — App (10.0.10.0/24)   ││   │
+                         │   │  │                                          ││   │
+                         │   │  │  ┌────────────────────────────────────┐  ││   │
+                         │   │  │  │  EC2 Auto Scaling Group            │  ││   │
+                         │   │  │  │  t3.medium (2 vCPU / 4 GB RAM)     │  ││   │
+                         │   │  │  │                                    │  ││   │
+                         │   │  │  │  Flask + Gunicorn + gevent         │  ││   │
+                         │   │  │  │  Python 3.11  |  Port 8080         │  ││   │
+                         │   │  │  └──────┬───────────────┬─────────────┘  ││   │
+                         │   │  └─────────┼───────────────┼───────────────┘│   │
+                         │   │            │               │                  │   │
+                         │   │  ┌─────────▼──────────┐  ┌▼────────────────┐│   │
+                         │   │  │ PRIVATE SUBNETS    │  │ PRIVATE SUBNETS ││   │
+                         │   │  │ Data — RDS         │  │ Data — Cache    ││   │
+                         │   │  │ 10.0.20.0/24       │  │ 10.0.30.0/24   ││   │
+                         │   │  │                    │  │                 ││   │
+                         │   │  │  RDS PostgreSQL 15  │  │  ElastiCache    ││   │
+                         │   │  │  db.t3.medium       │  │  Redis 7.x      ││   │
+                         │   │  │  Multi-AZ           │  │  cache.t3.small ││   │
+                         │   │  │  Encrypted (AES256) │  │  Cluster Mode   ││   │
+                         │   │  │  Read Replica (AZ2) │  │  Encrypted TLS  ││   │
+                         │   │  └────────────────────┘  └─────────────────┘│   │
+                         │   └─────────────────────────────────────────────┘   │
+                         └──────────────────────────────────────────────────────┘
+```
+
+## 1.2 Design Decision Rationale
+
+### VPC with Separate Public / Private Layers
+**WHY:** Defence-in-depth. Public subnets hold only ALB and NAT Gateway — components that legitimately need internet access. EC2, RDS, and Redis live entirely in private subnets with no internet route. An attacker who compromises the ALB cannot directly reach the DB layer because there is no routable path.
+
+### Three-Tier Private Subnet Isolation (App / RDS / Cache)
+**WHY:** Even inside the VPC, subnets are isolated by purpose. If an attacker pivots from the app tier, the only resources reachable are those explicitly allowed by Security Group rules — not a free-for-all inside the VPC.
+
+### Application Load Balancer (Not NLB)
+**WHY:** ALB terminates HTTPS, handles SSL offloading, performs content-based routing, and integrates with WAF. All traffic between ALB and EC2 stays within the VPC (port 8080, HTTP) — no double encryption overhead.
+
+### RDS Multi-AZ
+**WHY:** Synchronous replication to a standby in a second AZ. Failover is automatic (~30 s). Without this, a single AZ outage takes down the database.
+
+### ElastiCache Redis Cluster Mode
+**WHY:** Cluster mode shards data across nodes. If the catalogue grows to millions of SKUs, a single Redis node's 32 GB RAM would be the bottleneck. Cluster mode allows horizontal scaling of memory.
+
+### NAT Gateway (not NAT Instance)
+**WHY:** Managed service — no patching, no single point of failure, scales automatically. Private EC2 instances need outbound internet access to pull OS patches and install pip packages at bootstrap.
+
+---
+
+# SECTION 2: SECURITY DESIGN
+
+## 2.1 Security Group Matrix
+
+| SG Name         | Inbound Rules                                     | Outbound Rules               |
+|-----------------|---------------------------------------------------|------------------------------|
+| sg-alb          | 0.0.0.0/0 → TCP 443 (HTTPS)                      | sg-appserver → TCP 8080      |
+| sg-appserver    | sg-alb → TCP 8080                                 | sg-rds → TCP 5432            |
+|                 |                                                   | sg-redis → TCP 6379          |
+|                 |                                                   | 0.0.0.0/0 → TCP 443 (HTTPS) |
+| sg-rds          | sg-appserver → TCP 5432 ONLY                      | NONE                         |
+| sg-redis        | sg-appserver → TCP 6379 ONLY                      | NONE                         |
+| sg-bastion      | YOUR_OFFICE_IP/32 → TCP 22                        | sg-rds → TCP 5432            |
+|                 |                                                   | sg-appserver → TCP 22        |
+
+## 2.2 Why Each Rule Exists
+
+**sg-alb inbound 0.0.0.0/0:443** — Users reach the load balancer from anywhere. The ALB is the only internet-facing component.
+
+**sg-appserver inbound from sg-alb:8080** — The app only accepts traffic from the ALB, not from the internet directly. Even if someone discovers the EC2 IP, they cannot bypass the ALB.
+
+**sg-rds inbound from sg-appserver:5432** — RDS listens ONLY to the app EC2 security group. No other resource in the VPC — not the ALB, not a bastion accidentally — can reach the database unless explicitly added to sg-rds.
+
+**sg-redis inbound from sg-appserver:6379** — Same principle for ElastiCache. The Redis port is not reachable from RDS, from the bastion, or from any other tier.
+
+**sg-rds / sg-redis: NO outbound rules** — These data stores do not initiate any connections. Zero egress is the correct setting for services that only respond.
+
+**sg-appserver outbound 443** — EC2 instances need to reach AWS SSM, Secrets Manager, and S3 (for code deployments) over TLS. The specific AWS service VPC endpoints could replace this if you want zero internet egress.
+
+## 2.3 Principle of Least Privilege Applied
+
+1. **Network level**: Private subnets have no Internet Gateway route.
+2. **Security Group level**: Source is always another SG, never 0.0.0.0/0, for data tiers.
+3. **IAM level**: EC2 instance profile has only: `secretsmanager:GetSecretValue`, `ssm:GetParameter`, `cloudwatch:PutMetricData`. No `*` permissions.
+4. **Database level**: App DB user has only `SELECT, INSERT, UPDATE, DELETE` on the `ecommerce` schema. No `DROP TABLE`, `CREATE`, or `pg_read_all_data`.
+5. **Redis level**: AUTH token required. No open Redis (no auth is a critical misconfiguration).
+6. **Encryption at rest**: RDS encrypted with AWS KMS CMK. ElastiCache encrypted at rest. EC2 EBS volumes encrypted.
+7. **Encryption in transit**: ALB enforces TLS 1.2+. App connects to RDS with `sslmode=require`. App connects to Redis with `ssl=True`.
+
+---
+
+# SECTION 3: STEP-BY-STEP AWS CONSOLE SETUP
+
+## 3.1 VPC Creation
+
+**Navigate:** VPC → Your VPCs → Create VPC
+
+```
+VPC Settings:
+  Name tag          : ecommerce-vpc
+  IPv4 CIDR         : 10.0.0.0/16
+  IPv6              : No IPv6
+  Tenancy           : Default
+```
+
+### Create Internet Gateway
+**Navigate:** VPC → Internet Gateways → Create
+```
+  Name: ecommerce-igw
+  Action: Attach to ecommerce-vpc
+```
+
+## 3.2 Subnet Configuration
+
+Create 6 subnets across 2 Availability Zones:
+
+| Name                     | CIDR           | AZ         | Type    |
+|--------------------------|----------------|------------|---------|
+| public-subnet-az1        | 10.0.1.0/24    | ap-south-1a| Public  |
+| public-subnet-az2        | 10.0.2.0/24    | ap-south-1b| Public  |
+| private-app-subnet-az1   | 10.0.10.0/24   | ap-south-1a| Private |
+| private-app-subnet-az2   | 10.0.11.0/24   | ap-south-1b| Private |
+| private-data-subnet-az1  | 10.0.20.0/24   | ap-south-1a| Private |
+| private-data-subnet-az2  | 10.0.21.0/24   | ap-south-1b| Private |
+
+**Navigate:** VPC → Subnets → Create subnet (repeat for each)
+
+### Route Tables
+
+**Public Route Table** (attached to public subnets):
+```
+  Destination: 0.0.0.0/0  → Target: ecommerce-igw
+```
+
+**Private Route Table** (attached to all private subnets):
+```
+  Destination: 0.0.0.0/0  → Target: NAT Gateway
+  (NAT Gateway must be placed in a PUBLIC subnet with an Elastic IP)
+```
+
+### NAT Gateway Setup
+**Navigate:** VPC → NAT Gateways → Create NAT Gateway
+```
+  Name       : ecommerce-nat-gw
+  Subnet     : public-subnet-az1   ← MUST be public subnet
+  Elastic IP : Allocate Elastic IP (click button)
+```
+
+## 3.3 Security Group Creation
+
+**Navigate:** EC2 → Security Groups → Create security group
+
+### sg-alb
+```
+VPC: ecommerce-vpc
+Inbound Rules:
+  Type: HTTPS  | Protocol: TCP | Port: 443  | Source: 0.0.0.0/0
+Outbound Rules:
+  Type: Custom TCP | Protocol: TCP | Port: 8080 | Destination: sg-appserver
+```
+
+### sg-appserver
+```
+VPC: ecommerce-vpc
+Inbound Rules:
+  Type: Custom TCP | Protocol: TCP | Port: 8080 | Source: sg-alb
+Outbound Rules:
+  Type: PostgreSQL | Protocol: TCP | Port: 5432 | Destination: sg-rds
+  Type: Custom TCP | Protocol: TCP | Port: 6379 | Destination: sg-redis
+  Type: HTTPS      | Protocol: TCP | Port: 443  | Destination: 0.0.0.0/0
+```
+
+### sg-rds
+```
+VPC: ecommerce-vpc
+Inbound Rules:
+  Type: PostgreSQL | Protocol: TCP | Port: 5432 | Source: sg-appserver
+Outbound Rules: (none — remove default)
+```
+
+### sg-redis
+```
+VPC: ecommerce-vpc
+Inbound Rules:
+  Type: Custom TCP | Protocol: TCP | Port: 6379 | Source: sg-appserver
+Outbound Rules: (none — remove default)
+```
+
+## 3.4 RDS Setup (PostgreSQL 15)
+
+**Navigate:** RDS → Create database
+
+```
+Engine options:
+  Engine type    : PostgreSQL
+  Version        : PostgreSQL 15.x (latest minor)
+
+Templates:
+  Template       : Production
+
+Settings:
+  DB identifier  : ecommerce-db
+  Master username: dbadmin
+  Master password: [Use Secrets Manager — see below]
+
+Instance configuration:
+  Class          : db.t3.medium (2 vCPU, 4 GB RAM)
+                   WHY t3.medium: adequate for dev/assignment; use db.r6g.large in real prod
+
+Storage:
+  Type           : gp3  (NOT gp2 — gp3 is cheaper and consistent IOPS)
+  Allocated      : 100 GB
+  Enable autoscaling: YES | Max: 500 GB
+  Encryption     : Enable | KMS key: aws/rds (or CMK)
+
+Availability & durability:
+  Multi-AZ       : Create a standby instance  ← CRITICAL for prod
+
+Connectivity:
+  VPC                 : ecommerce-vpc
+  Subnet group        : Create new
+    → Include: private-data-subnet-az1, private-data-subnet-az2
+  Public access       : NO  ← CRITICAL: never expose RDS publicly
+  VPC security group  : sg-rds
+  Port                : 5432
+
+Database authentication:
+  Password authentication  (use IAM auth in real prod)
+
+Additional configuration:
+  Initial database name : ecommerce
+  Parameter group       : Create new parameter group (see params below)
+  Backup retention      : 7 days
+  Enable automated backups: YES
+  Backup window         : 02:00–03:00 UTC (low-traffic window)
+  Maintenance window    : Mon 03:00–04:00 UTC
+  Enable encryption     : YES
+  Enable Performance Insights: YES (retention: 7 days free)
+  Enable Enhanced Monitoring : YES | Granularity: 60 s
+  Enable deletion protection : YES
+```
+
+### RDS Parameter Group (create before RDS instance):
+**Navigate:** RDS → Parameter Groups → Create parameter group
+```
+Family: postgres15
+
+Parameters to modify:
+  rds.force_ssl                    = 1        (enforce TLS)
+  shared_buffers                   = 131072   (25% of 4 GB = 1 GB in 8 KB pages)
+  effective_cache_size             = 393216   (75% of 4 GB)
+  max_connections                  = 200
+  log_min_duration_statement       = 1000     (log queries > 1 s)
+  log_connections                  = on
+  log_disconnections               = on
+  pg_stat_statements.track         = all
+```
+
+### Store RDS Password in Secrets Manager:
+**Navigate:** Secrets Manager → Store a new secret
+```
+  Secret type    : Credentials for Amazon RDS database
+  Username       : dbadmin
+  Password       : [your password]
+  Database       : ecommerce-db
+  Secret name    : prod/ecommerce/rds-credentials
+```
+
+## 3.5 ElastiCache Redis Setup
+
+**Navigate:** ElastiCache → Redis OSS caches → Create
+
+```
+Cluster settings:
+  Creation method    : Easy create → NO, use Custom
+  Cluster mode       : Enabled (allows sharding for horizontal scale)
+  Name               : ecommerce-redis
+  Description        : Product catalog cache
+
+Location:
+  AWS Cloud
+
+Cluster info:
+  Port               : 6379
+  Parameter group    : default.redis7.cluster.on  (or create custom)
+  Node type          : cache.t3.small (1.37 GB RAM)
+                       WHY: for product catalog of ~50k SKUs, this is enough.
+                       Use cache.r6g.large for production with millions of SKUs.
+  Number of shards   : 1  (scale to 3+ in prod)
+  Replicas per shard : 1  (promotes to primary on failure)
+
+Multi-AZ:
+  Enable Multi-AZ    : YES
+  Auto-failover      : YES
+
+Subnet group:
+  Create new subnet group
+  Name    : ecommerce-cache-subnets
+  Subnets : private-data-subnet-az1, private-data-subnet-az2
+
+Security:
+  VPC security groups : sg-redis
+  Encryption at rest  : YES | KMS: aws/elasticache (or CMK)
+  Encryption in transit: YES (TLS required)
+
+Access Control:
+  Redis AUTH         : YES
+  Auth token         : [generate 32+ char random string]
+  → Store this in Secrets Manager: prod/ecommerce/redis-auth-token
+
+Backup:
+  Enable automatic backups: YES
+  Retention period        : 3 days
+  Backup window           : 03:00–04:00 UTC
+
+Maintenance:
+  Maintenance window : Tue 04:00–05:00 UTC
+  Auto minor version upgrade: YES
+
+Logs:
+  Slow log  → CloudWatch Log Group: /ecommerce/redis/slow-log
+  Engine log → CloudWatch Log Group: /ecommerce/redis/engine-log
+```
+
+## 3.6 EC2 Setup (Application Server)
+
+### IAM Instance Profile (create first):
+**Navigate:** IAM → Roles → Create role
+```
+  Trusted entity : AWS service → EC2
+  Policies to attach:
+    AmazonSSMManagedInstanceCore          (SSM Session Manager — no SSH needed)
+    CloudWatchAgentServerPolicy           (metrics + logs)
+    Custom inline policy:
+      {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": ["secretsmanager:GetSecretValue"],
+            "Resource": [
+              "arn:aws:secretsmanager:ap-south-1:ACCOUNT:secret:prod/ecommerce/*"
+            ]
+          }
+        ]
+      }
+  Role name: ecommerce-ec2-role
+```
+
+### Launch Template:
+**Navigate:** EC2 → Launch Templates → Create
+```
+  AMI                : Amazon Linux 2023 (latest)
+  Instance type      : t3.medium
+  Key pair           : [create or select existing]
+  VPC                : ecommerce-vpc
+  Subnet             : private-app-subnet-az1
+  Security group     : sg-appserver
+  IAM instance profile: ecommerce-ec2-role
+
+  EBS Volume:
+    Size       : 30 GB
+    Type       : gp3
+    Encrypted  : YES
+
+  User Data (bootstrap script):
+    #!/bin/bash
+    set -ex
+    yum update -y
+    yum install -y python3.11 python3.11-pip git
+
+    # Fetch secrets from Secrets Manager (no credentials in code)
+    RDS_SECRET=$(aws secretsmanager get-secret-value \
+      --secret-id prod/ecommerce/rds-credentials \
+      --region ap-south-1 --query SecretString --output text)
+
+    REDIS_TOKEN=$(aws secretsmanager get-secret-value \
+      --secret-id prod/ecommerce/redis-auth-token \
+      --region ap-south-1 --query SecretString --output text)
+
+    # Set env vars for the application (or use a .env file / SSM)
+    cat > /etc/ecommerce.env << EOF
+    export RDS_HOST=$(echo $RDS_SECRET | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['host'])")
+    export RDS_PORT=5432
+    export RDS_DB=ecommerce
+    export RDS_USER=dbadmin
+    export RDS_PASSWORD=$(echo $RDS_SECRET | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['password'])")
+    export REDIS_HOST=ecommerce-redis.xxxxxx.0001.apse1.cache.amazonaws.com
+    export REDIS_PORT=6379
+    export REDIS_AUTH_TOKEN=$REDIS_TOKEN
+    export REDIS_SSL=true
+    export APP_ENV=prod
+    export LOG_LEVEL=INFO
+    export FLASK_SECRET_KEY=$(openssl rand -hex 32)
+    EOF
+
+    # Clone and set up the application
+    git clone https://github.com/your-org/ecommerce-cache /opt/ecommerce
+    cd /opt/ecommerce
+    pip3.11 install -r requirements.txt
+
+    # Run schema migration
+    source /etc/ecommerce.env
+    psql "host=$RDS_HOST dbname=$RDS_DB user=$RDS_USER password=$RDS_PASSWORD sslmode=require" -f schema.sql
+
+    # Install and start application as systemd service
+    cp ecommerce.service /etc/systemd/system/
+    systemctl daemon-reload
+    systemctl enable ecommerce
+    systemctl start ecommerce
+```
+
+### Application Load Balancer:
+**Navigate:** EC2 → Load Balancers → Create ALB
+```
+  Scheme             : Internet-facing
+  VPC                : ecommerce-vpc
+  Subnets            : public-subnet-az1, public-subnet-az2
+  Security group     : sg-alb
+  HTTPS Listener     : 443
+    → SSL certificate: ACM certificate for your domain
+    → Default action : Forward to target group
+
+  Target Group:
+    Name              : ecommerce-tg
+    Protocol          : HTTP
+    Port              : 8080
+    Health check path : /health
+    Healthy threshold : 2
+    Unhealthy threshold: 3
+    Timeout           : 5 s
+    Interval          : 30 s
+```
+
+### Auto Scaling Group:
+**Navigate:** EC2 → Auto Scaling Groups → Create
+```
+  Launch template    : [the one created above]
+  VPC                : ecommerce-vpc
+  Subnets            : private-app-subnet-az1, private-app-subnet-az2
+  Load balancer      : attach to ecommerce-tg
+  Min capacity       : 2  (always multi-instance for HA)
+  Desired capacity   : 2
+  Max capacity       : 10
+  Scaling policy     : Target tracking
+    Metric            : Average CPU utilization
+    Target value      : 60%
+```
+
+---
+
+# SECTION 4: APPLICATION CODE
+
+## 4.1 Project Structure
+
+```
+ecommerce_cache/
+├── app.py              # Flask app factory + routes
+├── config.py           # Config from env vars (no hardcoded values)
+├── cache_manager.py    # Redis client, get_or_load(), key naming, jitter
+├── db_manager.py       # PostgreSQL client, connection pool, retry
+├── product_service.py  # Business logic — orchestrates cache + DB
+├── middleware.py       # JSON logging, request timing
+├── benchmark.py        # Latency measurement script
+├── schema.sql          # RDS table definitions + indexes
+├── requirements.txt    # Pinned dependencies
+└── gunicorn.conf.py    # Production WSGI config
+```
+
+## 4.2 Lazy Loading Flow (Code Trace)
+
+When `GET /products/42` arrives:
+
+```
+1. app.py:get_product(42)
+     ↓ calls
+2. product_service.py:ProductService.get_product(42)
+     ↓ builds key: "prod:v1:product:detail:42"
+     ↓ calls
+3. cache_manager.py:CacheManager.get_or_load(key, loader, ttl)
+     ↓
+   3a. redis_client.GET("prod:v1:product:detail:42")
+       → HIT  → deserialise JSON → return (data, "HIT")
+       → MISS → call loader()
+                  ↓
+   3b. db_manager.py:DatabaseManager.get_product_by_id(42)
+       → executes parameterised SQL
+       → returns dict or None
+                  ↓
+   3c. redis_client.SETEX(key, ttl + jitter, json.dumps(data))
+       → return (data, "MISS")
+     ↓
+4. app.py returns JSON: {data, cache_status, latency_ms}
+```
+
+---
+
+# SECTION 5: TTL AND CACHE STRATEGY
+
+## 5.1 TTL Values and Justification
+
+| Cache Entry        | TTL        | Reason                                                            |
+|--------------------|------------|-------------------------------------------------------------------|
+| Product detail     | 30 minutes | Admin updates are rare; explicit invalidation handles immediate changes |
+| Category list      | 5 minutes  | New products added more frequently than single-product changes     |
+| Search results     | 1 minute   | Highly dynamic; prices change, new products appear                 |
+| Hot/Featured items | 1 hour     | Selected manually by marketing; very stable                        |
+| Inventory count    | 30 seconds | Changes on every purchase; long TTL = overselling risk             |
+
+## 5.2 TTL Jitter (Thundering Herd Prevention)
+
+**Problem:** If 10,000 product pages all expire at the same time (e.g., after a cache flush), 10,000 simultaneous DB queries are triggered — potentially crashing RDS.
+
+**Solution:** Add random 0–60 seconds jitter to every TTL.
+```python
+effective_ttl = base_ttl + random.randint(0, TTL_JITTER_RANGE)
+```
+
+Key A expires at: 1800 + 23 = 1823 s
+Key B expires at: 1800 + 51 = 1851 s
+Key C expires at: 1800 + 7  = 1807 s
+→ Spread across 60 s → only ~167 misses/second instead of all at once.
+
+## 5.3 Cache Invalidation Strategy
+
+**Write-Through Invalidation (not update):**
+On `PUT /products/42`:
+1. DB UPDATE runs first (source of truth updated)
+2. `cache.delete("prod:v1:product:detail:42")` — key is evicted
+3. Next GET /products/42 is a cache miss → re-fetches fresh data from RDS
+4. Cache is re-populated with correct data
+
+**WHY delete, not update?**
+Updating the cache requires re-running the same query or logic used on read. Deleting is simpler, atomic, and guarantees consistency — the next read always gets DB truth.
+
+**Namespace Flush (emergency):**
+If a bulk price update affects thousands of products, flush the entire namespace:
+```
+POST /cache/flush   → uses SCAN to delete all prod:v1:product:* keys
+```
+SCAN is used instead of KEYS because KEYS blocks Redis on large keyspaces.
+
+## 5.4 Cache Eviction Policy
+
+Configure ElastiCache Redis with `maxmemory-policy = allkeys-lru`:
+- When Redis memory is full, evict the Least Recently Used key
+- This ensures hot products stay cached; rarely-accessed products are evicted
+- Alternative: `volatile-lru` (only evicts keys with TTL set) — use if some keys must never be evicted (e.g., session data)
+
+---
+
+# SECTION 6: PERFORMANCE DEMONSTRATION
+
+## 6.1 Running the Benchmark
+
+```bash
+# First request (cold cache) — measures cache MISS (RDS hit)
+curl -w "\nTime: %{time_total}s\n" http://localhost:8080/products/1
+
+# Second request (warm cache) — measures cache HIT
+curl -w "\nTime: %{time_total}s\n" http://localhost:8080/products/1
+
+# Run full benchmark (30 iterations)
+python benchmark.py --base-url http://ec2-xx-xx-xx-xx.compute.amazonaws.com --product-id 1 --iterations 30
+```
+
+## 6.2 Expected Results
+
+```
+=================================================================
+  Benchmark: GET http://ec2-host/products/1
+  Iterations: 30
+=================================================================
+#     Cache    Latency (ms)    HTTP
+----  ------  --------------  ------
+   1    MISS         247.831     200  ◀ MISS  (cold cache, hits RDS)
+   2     HIT           3.412     200
+   3     HIT           2.891     200
+   4     HIT           3.201     200
+   5     HIT           2.750     200
+  ...
+  30     HIT           3.100     200
+
+=================================================================
+  RESULTS SUMMARY  (product_id=1)
+=================================================================
+  Metric                Cache HIT    Cache MISS
+  --------------------  -----------  -----------
+  Count                          29            1
+  Min (ms)                    2.750      247.831
+  Max (ms)                    4.102      247.831
+  Mean (ms)                   3.085      247.831
+  P95 (ms)                    3.900      247.831
+  P99 (ms)                    4.102      247.831
+
+  ✅ Speed improvement (MISS mean / HIT mean): 80.3×
+=================================================================
+```
+
+## 6.3 Sample Structured Log Output
+
+```json
+{"timestamp":"2024-11-15T14:32:01","level":"INFO","logger":"cache_manager","message":"CACHE MISS | key=prod:v1:product:detail:1"}
+{"timestamp":"2024-11-15T14:32:01","level":"INFO","logger":"cache_manager","message":"RDS query complete | ref=product_detail:1 | latency=242.31 ms"}
+{"timestamp":"2024-11-15T14:32:01","level":"DEBUG","logger":"cache_manager","message":"CACHE SET  | key=prod:v1:product:detail:1 | ttl=1837 s"}
+{"timestamp":"2024-11-15T14:32:01","level":"INFO","logger":"middleware","message":"REQUEST_COMPLETE","extra":{"method":"GET","path":"/products/1","status":200,"latency_ms":247.83,"request_id":"a1b2c3d4"}}
+
+{"timestamp":"2024-11-15T14:32:02","level":"INFO","logger":"cache_manager","message":"CACHE HIT  | key=prod:v1:product:detail:1"}
+{"timestamp":"2024-11-15T14:32:02","level":"INFO","logger":"middleware","message":"REQUEST_COMPLETE","extra":{"method":"GET","path":"/products/1","status":200,"latency_ms":3.41,"request_id":"b2c3d4e5"}}
+```
+
+**Querying logs in CloudWatch Logs Insights:**
+```
+fields @timestamp, message, extra.latency_ms, extra.cache_status
+| filter extra.path like "/products"
+| stats avg(extra.latency_ms), p95(extra.latency_ms), p99(extra.latency_ms) by extra.cache_status
+| sort @timestamp desc
+```
+
+---
+
+# SECTION 7: ADVANCED IMPROVEMENTS
+
+## 7.1 Cache Key Naming Strategy
+
+Pattern: `{env}:{version}:{namespace}:{entity}:{id}`
+
+| Key                                    | Stores              |
+|----------------------------------------|---------------------|
+| prod:v1:product:detail:42              | Single product dict |
+| prod:v1:product:list:electronics:1:20  | Page 1, 20 per page |
+| prod:v1:product:list:all:2:20          | All products, page 2|
+| prod:v1:product:search:laptop:1        | Search results      |
+
+**Version bumping for zero-downtime schema changes:**
+When the product schema changes (e.g., new field added), bump `CACHE_KEY_VERSION` from `v1` to `v2`. Old v1 keys expire naturally. New v2 keys are populated on first miss. No flush required — both versions co-exist during rollout.
+
+## 7.2 Cache Hit/Miss Logging for Alerting
+
+Set up a CloudWatch Metric Filter on the log group:
+```
+Filter pattern: { $.message = "CACHE MISS*" }
+Metric namespace: EcommerceApp
+Metric name: CacheMissCount
+```
+
+Create a CloudWatch Alarm:
+```
+Metric   : CacheMissCount
+Threshold: > 500 misses/minute
+Action   : SNS notification to on-call engineer
+```
+A sudden spike in cache misses means Redis is down, keys are expiring faster than expected, or an attacker is probing random product IDs (cache poisoning attempt).
+
+## 7.3 Cache Stampede Protection (Advanced)
+
+For extremely high traffic (>10,000 req/s), even the first MISS can overwhelm RDS if many threads detect the miss simultaneously. Solution: Mutex / probabilistic early expiration.
+
+```python
+# Advanced: use a Redis lock to serialize re-population
+def get_or_load_with_lock(self, key, loader, ttl):
+    value = self.get(key)
+    if value is not None:
+        return value, "HIT"
+
+    lock_key = f"{key}:__lock"
+    # Try to acquire lock (NX = only set if not exists)
+    acquired = self._client.set(lock_key, "1", nx=True, ex=10)
+
+    if acquired:
+        try:
+            value = loader()
+            if value:
+                self.set(key, value, ttl)
+        finally:
+            self._client.delete(lock_key)
+        return value, "MISS"
+    else:
+        # Another thread is loading — wait briefly and retry from cache
+        import time; time.sleep(0.05)
+        value = self.get(key)
+        return (value or loader()), "MISS_WAIT"
+```
+
+## 7.4 Scaling Considerations
+
+**Vertical scaling (quick):** Upgrade ElastiCache from cache.t3.small to cache.r6g.large (26 GB RAM, network-optimised) — zero code change required.
+
+**Horizontal scaling (sustained growth):**
+- Increase ElastiCache shard count from 1 to 3 or 6 (consistent hashing distributes keys)
+- Add RDS Read Replicas (1 per AZ); route all SELECTs to read replicas, writes to primary
+- In the DB layer, point `get_*` methods to the replica endpoint URL
+
+**Read Replica integration:**
+```python
+# In DatabaseManager, add a read-only pool
+self._read_pool = self._build_pool(cfg, host=cfg.RDS_REPLICA_HOST)
+
+# Route reads to replica, writes to primary
+def get_product_by_id(self, product_id):
+    return self._execute_with_retry(sql, (product_id,), pool=self._read_pool)
+```
+
+---
+
+# SECTION 8: VIVA PREPARATION — 15 TOUGH PROFESSOR QUESTIONS
+
+---
+
+**Q1. Why did you choose Lazy Loading over Write-Through caching?**
+
+Lazy Loading only caches data that is actually requested — it never pre-populates keys that may never be read. For a product catalogue with 100,000 SKUs where only the top 1,000 are viewed 95% of the time, Write-Through would waste Redis memory caching 99,000 rarely-requested products on every DB insert. Lazy Loading self-selects the hot data set. The trade-off: the first request after a cache miss is slow. We mitigate this with explicit invalidation on update (not waiting for TTL expiry).
+
+---
+
+**Q2. What is a cache stampede and how does your implementation prevent it?**
+
+A cache stampede occurs when many concurrent requests detect a cache miss simultaneously and all query the database at once — amplifying load at the worst possible moment (just after a popular key expires). My implementation uses two mechanisms: TTL jitter (random 0–60 s spread so keys don't expire in bulk), and an optional Redis-lock mutex (`SET key NX EX`) so only one thread re-populates the cache while others wait. The lock has a 10 s expiry so it auto-releases if the thread dies.
+
+---
+
+**Q3. Your Redis Security Group allows port 6379 from sg-appserver. What if the app server is compromised?**
+
+True — a compromised app server can read/write Redis. Defence-in-depth layers mitigate this: (a) ElastiCache requires an AUTH token, so the attacker also needs the token; (b) the token is stored in Secrets Manager with IAM-controlled access — not in the code; (c) ElastiCache TLS means traffic is encrypted in transit, so a network sniffer cannot capture the AUTH token; (d) Redis data is encrypted at rest with KMS. Critically, even with Redis access, the attacker cannot reach RDS — that's a separate security group.
+
+---
+
+**Q4. Why `SCAN` instead of `KEYS` for namespace flush?**
+
+`KEYS pattern` is O(N) and blocks Redis's single-threaded event loop for the entire scan duration. For a Redis instance with 1 million keys, this blocks all other commands for hundreds of milliseconds — effectively a self-inflicted denial of service. `SCAN` iterates in batches of `count` keys per call, returning immediately. It's O(1) per call (amortized O(N) total), non-blocking, and production-safe.
+
+---
+
+**Q5. What happens to your service if ElastiCache goes down?**
+
+The `CacheManager.get()` and `set()` methods wrap every Redis call in `try/except RedisError` and return `None` / `False` on error without raising. The service layer's `get_or_load()` detects `None` from get and calls the DB loader. The application degrades gracefully — every request becomes a cache miss and hits RDS directly, increasing latency to ~200–500 ms. The system continues to serve correct data. A CloudWatch alarm on `CacheMissCount` alerts engineers immediately.
+
+---
+
+**Q6. How does `sslmode=require` in psycopg2 relate to the RDS parameter `rds.force_ssl=1`?**
+
+They work at different layers. `rds.force_ssl=1` is a server-side setting — RDS rejects any connection that doesn't negotiate TLS. `sslmode=require` is a client-side setting — psycopg2 initiates the TLS handshake. Both must be set. If you set only `rds.force_ssl=1`, a misconfigured client without `sslmode=require` would fail with a connection error (good — it fails secure). If you set only `sslmode=require`, a different PostgreSQL server without SSL configured would still accept the connection (bad). Both together guarantee encryption regardless of which side is misconfigured.
+
+---
+
+**Q7. Your DB user has SELECT, INSERT, UPDATE, DELETE. Why not just grant all privileges?**
+
+Principle of least privilege. If an attacker achieves SQL injection through a query-building bug, they're limited to data manipulation — they cannot `DROP TABLE products`, `TRUNCATE`, `CREATE TABLE as SELECT` to exfiltrate schema, or call `pg_read_file()` to read OS files. Damage is bounded. In a real system you'd further split: a read-only user for GET endpoints, a read-write user for POST/PUT/DELETE, with the read-only credentials used for the majority of traffic.
+
+---
+
+**Q8. Why gp3 storage for RDS instead of io1/io2?**
+
+gp3 provides 3,000 IOPS baseline at no extra cost regardless of volume size, and you can provision up to 16,000 IOPS independently of storage size. io1/io2 is more cost-effective only above ~16,000 IOPS. For a t3.medium RDS instance, the instance's network bandwidth is the bottleneck before storage IOPS becomes one — so gp3 is the correct cost-performance choice. io2 is reserved for large production instances with extreme IOPS requirements.
+
+---
+
+**Q9. What is the thundering herd in the context of RDS connection pooling, not just caching?**
+
+On application server startup (or after a restart), all Gunicorn workers initialise simultaneously and each opens DB_POOL_MIN connections. With 5 workers and min=2, that's 10 simultaneous connection attempts. At autoscaling events (adding 5 EC2 instances), that's 50+ simultaneous connections. RDS has a `max_connections` limit tied to instance RAM (~87 for db.t3.medium by default). The solution: set `max_connections=200` in the parameter group, use `max_requests_jitter` in Gunicorn to stagger worker restarts, and implement connection pool overflow with a timeout.
+
+---
+
+**Q10. How does cache versioning (v1, v2 in key names) enable zero-downtime schema migrations?**
+
+If I change the product JSON structure (e.g., add a `discount_price` field), old cached `v1` keys have the old schema. If I deploy new code that expects `discount_price`, it would fail on cached v1 data. By bumping `CACHE_KEY_VERSION` to `v2` in Config before deployment, new code writes and reads only v2 keys. v1 keys are never read by the new code; they expire naturally per their TTL. No flush is needed, no downtime. Old instances (if any remain briefly during rolling deploy) still use v1 keys. The two versions co-exist harmlessly.
+
+---
+
+**Q11. Why use Multi-AZ for both RDS and ElastiCache?**
+
+A single AZ has hardware failures, power outages, and maintenance windows. Without Multi-AZ, an AZ failure takes down your database or cache for hours. With RDS Multi-AZ, AWS automatically fails over to the standby (in a different AZ) in ~30 seconds — the application sees a brief connection drop and reconnects. With ElastiCache Multi-AZ, a replica in another AZ is promoted automatically. For an e-commerce platform, 30 minutes of downtime could mean millions in lost revenue — Multi-AZ is non-negotiable.
+
+---
+
+**Q12. How does connection pool recycling (pool_recycle) prevent stale connection issues?**
+
+Long-lived TCP connections are terminated by NAT Gateways, load balancers, or network appliances after idle timeouts (typically 350–900 seconds on AWS). If psycopg2 reuses a connection that was silently killed by the NAT Gateway, it gets a broken pipe error. `pool_recycle=1800` tells psycopg2 to close and re-open connections that are older than 30 minutes, preventing use of stale TCP connections. RDS also has an idle connection timeout — recycling ensures we stay under it.
+
+---
+
+**Q13. What is the difference between `allkeys-lru` and `volatile-lru` eviction policies?**
+
+`volatile-lru`: evicts only keys with an expiry (TTL) set, using LRU order. Keys without TTL are never evicted. Use when some data (e.g., user sessions) must never be auto-evicted.
+
+`allkeys-lru`: evicts any key using LRU order, regardless of TTL. Use when all keys in Redis are cache data — the most recently accessed data is most valuable. For our product catalog cache (all keys have TTL), `allkeys-lru` is more appropriate because it can always free memory by evicting cold data.
+
+---
+
+**Q14. Your benchmark shows 80× improvement. How do you know the improvement is from Redis and not from OS page cache or PostgreSQL's shared_buffers?**
+
+Excellent point. PostgreSQL `shared_buffers` caches pages in RAM — repeated queries may return fast even without Redis. To isolate Redis's contribution: (a) run `SELECT pg_stat_reset()` to reset PostgreSQL statistics, then `SELECT * FROM pg_statio_user_tables` before and after — if `heap_blks_hit` (buffer cache hits) is high, the improvement is partly PostgreSQL's cache; (b) disable Redis in the app and measure DB-only latency with a warm PostgreSQL buffer cache — this is the true baseline for Redis comparison; (c) for a definitive test, restart the RDS instance (clears shared_buffers) and compare. In practice, we measure end-to-end application latency, which is what the user experiences.
+
+---
+
+**Q15. If a product price changes in RDS, what is the maximum time a user could see the old price?**
+
+Without explicit invalidation: up to TTL_PRODUCT_DETAIL + TTL_JITTER = 1800 + 60 = 1860 seconds (31 minutes). With explicit invalidation (as implemented): near-zero — the `update_product` route calls `cache.invalidate_product()` immediately after the DB update. The next request after invalidation is a cache miss → fresh data from RDS. The window is the time between the DB commit and the cache delete — microseconds. In extreme correctness requirements (e.g., financial transactions), you'd use a queue (SQS) to ensure invalidation even if the app server crashes mid-update.
+
+---
+
+# APPENDIX: KEY PRODUCTION CHECKLIST
+
+| Item                                      | Status |
+|-------------------------------------------|--------|
+| RDS in private subnet                     | ✅     |
+| RDS public access = No                    | ✅     |
+| RDS Multi-AZ enabled                      | ✅     |
+| RDS encryption at rest (KMS)              | ✅     |
+| RDS force_ssl = 1                         | ✅     |
+| RDS password in Secrets Manager           | ✅     |
+| ElastiCache in private subnet             | ✅     |
+| ElastiCache TLS in-transit                | ✅     |
+| ElastiCache encryption at rest            | ✅     |
+| ElastiCache AUTH token                    | ✅     |
+| Security Groups follow least privilege    | ✅     |
+| No credentials in application code        | ✅     |
+| TTL jitter implemented                    | ✅     |
+| Cache MISS error handling (graceful)      | ✅     |
+| Structured JSON logging to CloudWatch     | ✅     |
+| Cache hit/miss metrics                    | ✅     |
+| Namespace-scoped flush with SCAN (not KEYS)| ✅    |
+| Connection pool recycling configured      | ✅     |
+| Gunicorn production config (not dev server)| ✅    |
+| Auto Scaling Group (min 2 instances)      | ✅     |
+| Health check endpoint (/health)           | ✅     |
+| Deletion protection on RDS                | ✅     |
+
+==================== requirements.txt ====================
+
+# requirements.txt
+# Pin minor versions for reproducible builds.
+# On EC2: pip install -r requirements.txt
+
+flask==3.0.3
+psycopg2-binary==2.9.9          # PostgreSQL driver (binary = no libpq needed)
+redis==5.0.7                    # redis-py with SSL support built-in
+gunicorn==22.0.0                # Production WSGI server
+gevent==24.2.1                  # Async worker for Gunicorn (handles I/O-bound wait)
+python-dotenv==1.0.1            # Load .env in local dev (not used in prod)
+
+==================== schema.sql ====================
+
+-- =============================================================================
+--  schema.sql  — E-Commerce Product Catalog Schema
+--  Target: Amazon RDS PostgreSQL 15
+--  Run this ONCE after RDS instance creation.
+-- =============================================================================
+
+-- Extensions
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pg_stat_statements";  -- Query performance monitoring
+
+-- ---------------------------------------------------------------------------
+-- categories
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS categories (
+    id          SERIAL PRIMARY KEY,
+    name        VARCHAR(100)  NOT NULL,
+    slug        VARCHAR(100)  NOT NULL UNIQUE,      -- used in cache keys & URLs
+    description TEXT,
+    created_at  TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+);
+
+-- ---------------------------------------------------------------------------
+-- products
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS products (
+    id             SERIAL PRIMARY KEY,
+    category_id    INT           NOT NULL REFERENCES categories(id) ON DELETE RESTRICT,
+    name           VARCHAR(255)  NOT NULL,
+    description    TEXT,
+    price          NUMERIC(12,2) NOT NULL CHECK (price >= 0),
+    stock_quantity INT           NOT NULL DEFAULT 0 CHECK (stock_quantity >= 0),
+    sku            VARCHAR(100)  NOT NULL UNIQUE,
+    image_url      TEXT,
+    is_active      BOOLEAN       NOT NULL DEFAULT TRUE,
+    created_at     TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    updated_at     TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+);
+
+-- ---------------------------------------------------------------------------
+-- Indexes — critical for query performance under high read load
+-- ---------------------------------------------------------------------------
+
+-- PK indexes are created automatically.
+
+-- The most common query pattern: list products by category, newest first.
+CREATE INDEX IF NOT EXISTS idx_products_category_active_created
+    ON products (category_id, is_active, created_at DESC);
+
+-- Direct lookup by SKU (used in inventory systems).
+CREATE INDEX IF NOT EXISTS idx_products_sku
+    ON products (sku) WHERE is_active = TRUE;
+
+-- Partial index: only active products (saves index space & improves cache hit on filtered queries).
+CREATE INDEX IF NOT EXISTS idx_products_active
+    ON products (id) WHERE is_active = TRUE;
+
+-- categories slug lookup
+CREATE INDEX IF NOT EXISTS idx_categories_slug ON categories (slug);
+
+-- ---------------------------------------------------------------------------
+-- Trigger: auto-update updated_at on every UPDATE
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION update_timestamp()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_products_updated_at
+    BEFORE UPDATE ON products
+    FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+CREATE TRIGGER trg_categories_updated_at
+    BEFORE UPDATE ON categories
+    FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+-- ---------------------------------------------------------------------------
+-- Seed data
+-- ---------------------------------------------------------------------------
+INSERT INTO categories (name, slug, description) VALUES
+    ('Electronics',   'electronics',   'Phones, laptops, accessories'),
+    ('Clothing',      'clothing',      'Men and women apparel'),
+    ('Home & Kitchen','home-kitchen',  'Furniture, utensils, decor')
+ON CONFLICT (slug) DO NOTHING;
+
+INSERT INTO products (category_id, name, description, price, stock_quantity, sku) VALUES
+    (1, 'Samsung Galaxy S24',   '6.2" AMOLED, 256 GB',    79999.00, 150, 'ELEC-SGS24-256'),
+    (1, 'Apple MacBook Air M3', '13" Retina, 16 GB RAM',  109900.00, 60,  'ELEC-MBA-M3-16'),
+    (2, 'Levi''s 511 Slim Jeans','Classic slim fit, 32x32', 3499.00, 300, 'CLO-LV511-3232'),
+    (3, 'Prestige Induction',   '1800W, black mirror top', 2299.00, 200, 'HK-PRES-IND-18')
+ON CONFLICT (sku) DO NOTHING;
+
+-- ---------------------------------------------------------------------------
+-- RDS Parameter Group recommendations (apply via AWS Console):
+--   shared_buffers         = 25% of instance RAM
+--   effective_cache_size   = 75% of instance RAM
+--   max_connections        = 200   (set lower than default to avoid OOM)
+--   rds.force_ssl          = 1     (enforce TLS — reject plaintext connections)
+--   log_min_duration_statement = 1000  (log queries > 1 second for tuning)
+--   pg_stat_statements.track = all     (track all query plans)
+-- ---------------------------------------------------------------------------

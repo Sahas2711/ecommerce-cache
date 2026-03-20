@@ -1,0 +1,10 @@
+# requirements.txt
+# Pin minor versions for reproducible builds.
+# On EC2: pip install -r requirements.txt
+
+flask==3.0.3
+psycopg2-binary==2.9.9          # PostgreSQL driver (binary = no libpq needed)
+redis==5.0.7                    # redis-py with SSL support built-in
+gunicorn==22.0.0                # Production WSGI server
+gevent==24.2.1                  # Async worker for Gunicorn (handles I/O-bound wait)
+python-dotenv==1.0.1            # Load .env in local dev (not used in prod)
