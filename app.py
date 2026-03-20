@@ -14,7 +14,8 @@ from product_service import ProductService
 from cache_manager import CacheManager
 from db_manager import DatabaseManager
 from middleware import setup_logging, RequestTimingMiddleware
-
+from dotenv import load_dotenv
+load_dotenv()
 # ---------------------------------------------------------------------------
 # Application factory
 # ---------------------------------------------------------------------------
@@ -39,17 +40,33 @@ def create_app(config_object: Config = None) -> Flask:
     # ------------------------------------------------------------------
     # Health check  (load-balancer target group uses this)
     # ------------------------------------------------------------------
-    @app.route("/health", methods=["GET"])
+    @app.route("/health")
     def health():
-        db_ok    = db.ping()
-        cache_ok = cache.ping()
-        status   = "healthy" if (db_ok and cache_ok) else "degraded"
-        code     = 200 if status == "healthy" else 503
-        return jsonify({
-            "status"      : status,
-            "rds_reachable": db_ok,
-            "redis_reachable": cache_ok,
-        }), code
+        try:
+            # RDS
+            conn = db.get_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.close()
+            conn.close()
+
+            # Redis
+            cache.client.ping()   # ✅ FIXED
+
+            return {
+                "status": "healthy",
+                "rds_reachable": True,
+                "redis_reachable": True
+            }
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            return {
+                "status": "error",
+                "message": str(e)
+            }, 500
 
     # ------------------------------------------------------------------
     # GET /products/<id>  — primary demonstration endpoint
