@@ -19,14 +19,18 @@ A **high-performance, production-ready caching layer** built using:
 
 ## 🏗️ Architecture
 
-```mermaid
-graph TD
-    User --> Route53
-    Route53 --> ALB
-    ALB --> EC2
-    EC2 --> Redis
-    EC2 --> RDS
-```
+![AWS Architecture](./Architecture_Diagram.png)
+> ⚡ Implements **Cache-Aside (Lazy Loading Pattern)** for optimized read performance
+
+### 🔁 Cache-Aside (Lazy Loading) Flow
+
+```text
+1. Client request → EC2
+2. EC2 checks Redis (GET)
+   → HIT → return response (~3ms)
+   → MISS → query RDS (~250ms)
+3. Store result in Redis (SET)
+4. Return response to user
 
 ### Key Design Decisions
 
@@ -54,7 +58,7 @@ graph TD
 | Backend  | Flask + Gunicorn    |
 | Database | PostgreSQL (RDS)    |
 | Cache    | Redis (ElastiCache) |
-| Infra    | AWS (VPC, EC2, ALB) |
+| Infra    | AWS (VPC, EC2)      |
 
 ---
 
